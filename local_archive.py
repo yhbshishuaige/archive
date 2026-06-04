@@ -783,31 +783,40 @@ def main(argv: list[str] | None = None) -> int:
 
         config = load_config()
 
+        performed = False
+        exit_code = 0
+
+        def record(code: int) -> None:
+            nonlocal performed, exit_code
+            performed = True
+            exit_code = max(exit_code, code)
+
         if args.set_base:
-            return set_default_base(args, config)
+            record(set_default_base(args, config))
         if args.set_workspace:
-            return set_default_workspace(args, config)
+            record(set_default_workspace(args, config))
         if args.get_readme:
-            return get_readme_template(args.force)
+            record(get_readme_template(args.force))
+        if args.repair:
+            record(repair_archives(config))
+        if args.packed_folder:
+            record(archive_folder(args, config))
+        if args.search:
+            record(search_readmes(args, config))
+        if args.unpack:
+            record(unpack_archive(args, config))
         if args.show_config:
-            return show_config(config)
+            record(show_config(config))
         if args.show_base or args.show_workspace:
             if args.show_base:
                 show_base(config)
             if args.show_workspace:
                 show_workspace(config)
-            return 0
-        if args.repair:
-            return repair_archives(config)
-        if args.search:
-            return search_readmes(args, config)
-        if args.unpack:
-            return unpack_archive(args, config)
-        if args.packed_folder:
-            return archive_folder(args, config)
+            record(0)
 
-        parser.print_help()
-        return 0
+        if not performed:
+            parser.print_help()
+        return exit_code
     except ArchiveError as exc:
         error(str(exc))
         return 2
