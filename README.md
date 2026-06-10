@@ -108,6 +108,17 @@ archive --uninstall -f
 
 ![](./img/del.png)
 
+**更新**
+
+- 新增更新功能，保留~/.archive中数据的情况下，更新archive文件
+
+```bash
+archive --update /new/archive/path
+```
+
+![](./img/update.png)
+
+
 ## `.MY_README.md` 
 
 ```markdown
@@ -125,3 +136,5 @@ archive --uninstall -f
 - ubuntu18默认python是3.7无法使用这个垃圾项目（
 
 python版本 >= 3.8
+
+> 添加进度条功能，在打包大文件的时候可以看到进度

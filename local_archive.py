@@ -8,8 +8,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +37,8 @@ README_TEMPLATE = """# 归档说明
 """
 FLAG_SHORT_OPTIONS = set("hzrfgc")
 VALUE_SHORT_OPTIONS = set("pbsWuwF")
+COPY_CHUNK_SIZE = 1024 * 1024
+PROGRESS_BAR_WIDTH = 28
 
 
 class ArchiveError(Exception):
@@ -51,6 +55,66 @@ def warn(message: str) -> None:
 
 def error(message: str) -> None:
     print(f"[ERROR] {message}", file=sys.stderr)
+
+
+def format_size(size: float) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+
+
+class ProgressBar:
+    """Small stderr progress bar for long file operations."""
+
+    def __init__(self, label: str, total: int) -> None:
+        self.label = label
+        self.total = max(total, 0)
+        self.current = 0
+        self.started_at = time.monotonic()
+        self.last_rendered_at = 0.0
+        self.enabled = self.total > 0 and sys.stderr.isatty()
+
+    def advance(self, amount: int) -> None:
+        if amount <= 0:
+            return
+        self.current = min(self.current + amount, self.total) if self.total else self.current + amount
+        self.render()
+
+    def render(self, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and self.current < self.total and now - self.last_rendered_at < 0.1:
+            return
+
+        ratio = 1.0 if self.total == 0 else min(self.current / self.total, 1.0)
+        filled = int(PROGRESS_BAR_WIDTH * ratio)
+        bar = "#" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
+        elapsed = max(now - self.started_at, 0.001)
+        rate = self.current / elapsed
+        print(
+            (
+                f"\r[INFO] {self.label} [{bar}] {ratio * 100:6.2f}% "
+                f"{format_size(self.current)}/{format_size(self.total)} "
+                f"{format_size(rate)}/s"
+            ),
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+        self.last_rendered_at = now
+
+    def finish(self) -> None:
+        if not self.enabled:
+            return
+        self.current = self.total
+        self.render(force=True)
+        print(file=sys.stderr, flush=True)
 
 
 def expand_path(value: str | Path) -> Path:
@@ -301,30 +365,73 @@ def source_files(source: Path) -> list[Path]:
     return files
 
 
+def regular_file_size(path: Path, *, follow_symlinks: bool = True) -> int:
+    try:
+        file_stat = path.stat() if follow_symlinks else path.lstat()
+    except OSError:
+        return 0
+    if not stat.S_ISREG(file_stat.st_mode):
+        return 0
+    return file_stat.st_size
+
+
+def write_zip_member(archive: zipfile.ZipFile, item: Path, arcname: str, progress: ProgressBar) -> None:
+    if not item.is_file():
+        archive.write(item, arcname)
+        return
+
+    zip_info = zipfile.ZipInfo.from_file(item, arcname)
+    zip_info.compress_type = zipfile.ZIP_DEFLATED
+    with item.open("rb") as source_file, archive.open(zip_info, "w") as target_file:
+        while True:
+            chunk = source_file.read(COPY_CHUNK_SIZE)
+            if not chunk:
+                break
+            target_file.write(chunk)
+            progress.advance(len(chunk))
+
+
+def verify_zip(zip_path: Path, expected: set[str]) -> None:
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        members = [member for member in archive.infolist() if not member.is_dir()]
+        progress = ProgressBar("zip 校验进度", sum(member.file_size for member in members))
+        for member in members:
+            try:
+                with archive.open(member, "r") as source_file:
+                    while True:
+                        chunk = source_file.read(COPY_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        progress.advance(len(chunk))
+            except Exception as exc:
+                raise ArchiveError(f"zip 校验失败，损坏条目：{member.filename} ({exc})") from exc
+        progress.finish()
+        actual = {member.filename for member in members}
+
+    missing = expected - actual
+    if missing:
+        sample = ", ".join(sorted(missing)[:5])
+        raise ArchiveError(f"zip 内容不完整，缺少：{sample}")
+
+
 def write_zip(source: Path, zip_path: Path) -> None:
     files = source_files(source)
     expected = {item.relative_to(source).as_posix() for item in files}
+    info(f"准备 zip 打包：{len(files)} 个文件，约 {format_size(sum(regular_file_size(item) for item in files))}")
+    progress = ProgressBar("zip 打包进度", sum(regular_file_size(item) for item in files))
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for directory in sorted((item for item in source.rglob("*") if item.is_dir()), key=str):
             rel = directory.relative_to(source).as_posix()
             if rel:
                 archive.write(directory, f"{rel}/")
         for item in sorted(files, key=str):
-            archive.write(item, item.relative_to(source).as_posix())
+            write_zip_member(archive, item, item.relative_to(source).as_posix(), progress)
+    progress.finish()
 
     if not zip_path.exists() or zip_path.stat().st_size <= 0:
         raise ArchiveError("zip 文件不存在或大小为 0")
 
-    with zipfile.ZipFile(zip_path, "r") as archive:
-        bad_file = archive.testzip()
-        if bad_file:
-            raise ArchiveError(f"zip 校验失败，损坏条目：{bad_file}")
-        actual = {name for name in archive.namelist() if not name.endswith("/")}
-
-    missing = expected - actual
-    if missing:
-        sample = ", ".join(sorted(missing)[:5])
-        raise ArchiveError(f"zip 内容不完整，缺少：{sample}")
+    verify_zip(zip_path, expected)
 
 
 def safe_extract_zip(zip_path: Path, target: Path) -> None:
@@ -337,8 +444,30 @@ def safe_extract_zip(zip_path: Path, target: Path) -> None:
         archive.extractall(target)
 
 
+def copy_file_with_progress(source: Path, target: Path, progress: ProgressBar) -> str:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with source.open("rb") as source_file, target.open("wb") as target_file:
+        while True:
+            chunk = source_file.read(COPY_CHUNK_SIZE)
+            if not chunk:
+                break
+            target_file.write(chunk)
+            progress.advance(len(chunk))
+    shutil.copystat(source, target)
+    return str(target)
+
+
 def copy_source(source: Path, target: Path) -> None:
-    shutil.copytree(source, target, symlinks=True)
+    files = [item for item in source.rglob("*") if item.is_file() and not item.is_symlink()]
+    total_size = sum(regular_file_size(item, follow_symlinks=False) for item in files)
+    info(f"准备复制目录：{len(files)} 个文件，约 {format_size(total_size)}")
+    progress = ProgressBar("复制进度", total_size)
+
+    def copy_function(source_name: str, target_name: str) -> str:
+        return copy_file_with_progress(Path(source_name), Path(target_name), progress)
+
+    shutil.copytree(source, target, symlinks=True, copy_function=copy_function)
+    progress.finish()
 
 
 def remove_source_contents(source: Path) -> None:
@@ -678,6 +807,82 @@ def config_file_for_uninstall() -> Path:
     return CONFIG_FILE
 
 
+def resolve_update_source(value: str) -> Path:
+    source = expand_path(value)
+    if source.is_file():
+        return source
+    if not source.is_dir():
+        raise ArchiveError(f"--update 路径不存在：{source}")
+
+    candidates = [
+        source / "local_archive.py",
+        source / "archive_source" / "local_archive.py",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    raise ArchiveError(f"--update 目录中没有找到 local_archive.py：{source}")
+
+
+def current_archive_executable() -> Path:
+    command = sys.argv[0]
+    if command and (os.sep in command or (os.altsep and os.altsep in command)):
+        script_path = expand_path(command)
+        if script_path.name == "local_archive.py":
+            found = shutil.which("archive")
+            return expand_path(found) if found else expand_path("/usr/bin/archive")
+        return script_path
+
+    found = shutil.which(command or "archive")
+    if found:
+        return expand_path(found)
+    return expand_path("/usr/bin/archive")
+
+
+def update_archive(args: argparse.Namespace) -> int:
+    source = resolve_update_source(args.update)
+    target = expand_path(args.update_target) if args.update_target else current_archive_executable()
+
+    if target.exists() and target.is_dir():
+        raise ArchiveError(f"更新目标不能是目录：{target}")
+    try:
+        if target.exists() and source.samefile(target):
+            warn(f"源脚本和目标相同，无需更新：{target}")
+            return 0
+    except OSError:
+        pass
+
+    if not target.parent.is_dir():
+        raise ArchiveError(f"更新目标目录不存在：{target.parent}")
+
+    mode = 0o755
+    if target.exists():
+        mode = stat.S_IMODE(target.stat().st_mode)
+    mode |= stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+
+    temp_path: Path | None = None
+    try:
+        file_descriptor, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+        os.close(file_descriptor)
+        temp_path = Path(temp_name)
+        shutil.copy2(source, temp_path)
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, target)
+    except PermissionError as exc:
+        raise ArchiveError(f"更新失败，权限不足；更新 {target} 通常需要 sudo：{exc}") from exc
+    except OSError as exc:
+        raise ArchiveError(f"更新失败：{exc}") from exc
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
+
+    info(f"已更新 archive 脚本：{target}")
+    info(f"来源脚本：{source}")
+    info(f"保留配置文件：{config_file_for_uninstall()}")
+    return 0
+
+
 def uninstall_archive(args: argparse.Namespace) -> int:
     if not args.force:
         raise ArchiveError("卸载会删除可执行文件和 ~/.archive；请加 -f/--force 确认")
@@ -766,6 +971,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--show_base", "--show-base", action="store_true", help="显示默认知识库路径")
     parser.add_argument("--show_workspace", "--show-workspace", action="store_true", help="显示默认 workspace")
     parser.add_argument("--repair", action="store_true", help="修复 ~/.archive 中因 base 改名而失效的归档路径")
+    parser.add_argument("--update", metavar="SOURCE", help="用 SOURCE 中的 local_archive.py 更新当前 archive 命令，不删除 ~/.archive")
+    parser.add_argument("--update_target", "--update-target", help=argparse.SUPPRESS)
     parser.add_argument("--uninstall", action="store_true", help="卸载 archive：删除 /usr/bin/archive 和 ~/.archive，需要配合 -f")
     parser.add_argument("--uninstall_target", "--uninstall-target", help=argparse.SUPPRESS)
     parser._optionals.title = "选项"
@@ -780,43 +987,36 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.uninstall:
             return uninstall_archive(args)
+        if args.update:
+            return update_archive(args)
 
         config = load_config()
 
-        performed = False
-        exit_code = 0
-
-        def record(code: int) -> None:
-            nonlocal performed, exit_code
-            performed = True
-            exit_code = max(exit_code, code)
-
         if args.set_base:
-            record(set_default_base(args, config))
+            return set_default_base(args, config)
         if args.set_workspace:
-            record(set_default_workspace(args, config))
+            return set_default_workspace(args, config)
         if args.get_readme:
-            record(get_readme_template(args.force))
-        if args.repair:
-            record(repair_archives(config))
-        if args.packed_folder:
-            record(archive_folder(args, config))
-        if args.search:
-            record(search_readmes(args, config))
-        if args.unpack:
-            record(unpack_archive(args, config))
+            return get_readme_template(args.force)
         if args.show_config:
-            record(show_config(config))
+            return show_config(config)
         if args.show_base or args.show_workspace:
             if args.show_base:
                 show_base(config)
             if args.show_workspace:
                 show_workspace(config)
-            record(0)
+            return 0
+        if args.repair:
+            return repair_archives(config)
+        if args.search:
+            return search_readmes(args, config)
+        if args.unpack:
+            return unpack_archive(args, config)
+        if args.packed_folder:
+            return archive_folder(args, config)
 
-        if not performed:
-            parser.print_help()
-        return exit_code
+        parser.print_help()
+        return 0
     except ArchiveError as exc:
         error(str(exc))
         return 2
