@@ -142,3 +142,7 @@ python版本 >= 3.8
 添加进度条功能，在打包大文件的时候可以看到进度
 
 ![](./img/loading.png)
+
+unpack也添加了类似pack的进度条
+
+![](./img/un_loading.png)
