@@ -434,14 +434,29 @@ def write_zip(source: Path, zip_path: Path) -> None:
     verify_zip(zip_path, expected)
 
 
-def safe_extract_zip(zip_path: Path, target: Path) -> None:
+def safe_extract_zip(zip_path: Path, target: Path, progress: ProgressBar | None = None) -> None:
     target = target.resolve()
     with zipfile.ZipFile(zip_path, "r") as archive:
         for member in archive.infolist():
             destination = (target / member.filename).resolve()
             if not is_relative_to(destination, target):
                 raise ArchiveError(f"zip 中存在非法路径，拒绝解压：{member.filename}")
-        archive.extractall(target)
+        if progress is None:
+            archive.extractall(target)
+        else:
+            for member in archive.infolist():
+                target_path = target / member.filename
+                if member.is_dir():
+                    target_path.mkdir(parents=True, exist_ok=True)
+                else:
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(member, "r") as source_file, target_path.open("wb") as target_file:
+                        while True:
+                            chunk = source_file.read(COPY_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            target_file.write(chunk)
+                            progress.advance(len(chunk))
 
 
 def copy_file_with_progress(source: Path, target: Path, progress: ProgressBar) -> str:
@@ -719,18 +734,30 @@ def unpack_archive(args: argparse.Namespace, config: dict) -> int:
         zip_path = archive_dir / (content_name or "content.zip")
         if not zip_path.is_file():
             raise ArchiveError(f"meta.json 指向的 zip 不存在：{zip_path}")
-        safe_extract_zip(zip_path, target)
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            total_size = sum(member.file_size for member in archive.infolist() if not member.is_dir())
+        progress = ProgressBar("解压进度", total_size)
+        safe_extract_zip(zip_path, target, progress)
+        progress.finish()
         info(f"已解压 zip 到：{target}")
     else:
         files_dir = archive_dir / (content_name or "files")
         if not files_dir.is_dir():
             raise ArchiveError(f"归档内容不存在：{files_dir}")
-        for item in files_dir.iterdir():
-            destination = target / item.name
-            if item.is_dir() and not item.is_symlink():
-                shutil.copytree(item, destination, symlinks=True, dirs_exist_ok=True)
+        all_files = [item for item in files_dir.rglob("*") if item.is_file() and not item.is_symlink()]
+        total_size = sum(regular_file_size(item, follow_symlinks=False) for item in all_files)
+        progress = ProgressBar("解压进度", total_size)
+        for item in files_dir.rglob("*"):
+            rel = item.relative_to(files_dir)
+            destination = target / rel
+            if item.is_dir():
+                destination.mkdir(parents=True, exist_ok=True)
+            elif item.is_symlink():
+                if not destination.exists():
+                    destination.symlink_to(os.readlink(str(item)))
             else:
-                shutil.copy2(item, destination)
+                copy_file_with_progress(item, destination, progress)
+        progress.finish()
         info(f"已复制归档内容到：{target}")
 
     return 0
